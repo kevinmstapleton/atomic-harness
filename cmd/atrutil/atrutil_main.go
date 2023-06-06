@@ -4,17 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil" // TODO: shouldn't need this anymore
 
 	//"log"
-	"errors"
+
 	"os"
 	"path/filepath"
 	"regexp"
 
-	//"regexp"
 	//"runtime"
 	"strconv"
 	"strings"
@@ -37,6 +37,9 @@ var gUnsafe = false
 var gPatchCriteriaRefsMode = false
 var gFindTestVal string
 var gFindTestCoverage = false
+
+// sh /tmp/artwork-T1560.002_3-458617291/goart-T1560.002-test.bash
+var gRxUnixRedirect = regexp.MustCompile(`\d?>>?[ ]?([#{}._/\-0-9A-Za-z ]+)`)
 
 func init() {
 	flag.StringVar(&flagCriteriaPath, "criteriapath", "", "path to folder containing CSV files used to validate telemetry")
@@ -371,42 +374,110 @@ func FindCoverage(filename string, atomicMap map[string][]*types.TestSpec) int {
 	return criteria
 }
 
-// Custom error specifically for the Generate Criteria Function
-type GenCriteriaError struct {
-	StatusCode int
+func stripCommandComment(cmd string, executorName string) (string, string) {
+	if len(cmd) == 0 || executorName == "powershell" || executorName == "command_prompt" {
+		return cmd, ""
+	}
 
-	Err error
+	// unix shells comments start with '#'
+
+	// first, mask out the parameter parts like  #{param}
+
+	tmp := strings.ReplaceAll(cmd, "#{", "^%")
+
+	// now see if any comments exist
+
+	parts := strings.Split(tmp, "#")
+	if len(parts) <= 1 {
+		return cmd, ""
+	}
+
+	// only consider the last one
+
+	comment := parts[len(parts)-1]
+	return cmd[0 : len(cmd)-len(comment)-1], comment
 }
 
-func (r *GenCriteriaError) Error() string {
-	return fmt.Sprintf("status %d: err %v", r.StatusCode, r.Err)
+// given a string of piped unix commands, return array of the individual
+// commands.
+// examples:
+//
+//	in1:  "/bin/ls /tmp/"
+//	out1: [ "/bin/ls /tmp/" ]
+//	in2:  "ls /etc | grep pa | sort"
+//	out2: [ "ls /etc/ " " grep pa " " sort" ]
+func SplitPipedCommands(cmd string, executorName string) []string {
+	if len(cmd) == 0 || executorName == "powershell" || executorName == "command_prompt" {
+		return []string{cmd}
+	}
+	ret := strings.Split(cmd, "|")
+	return ret
 }
 
-func GenerateCriteria(tid string) *GenCriteriaError {
+// given a unix command with file redirects, return command and array
+// of file path targets
+// example:
+//
+//	in1:  "/bin/myexe 2>/dev/null >> /tmp/abc"
+//	out1: "/bin/myexe " [ "/dev/null" "/tmp/abc" ]
+func extractFileRedirects(cmd string, executorName string) (string, []string) {
+	paths := []string{}
+	if len(cmd) == 0 || executorName == "powershell" || executorName == "command_prompt" {
+		return cmd, paths
+	}
 
-	//var atomicTests = map[string][]*types.TestSpec{} // tid -> tests
+	// look for ''> some_file',  '>> some_file', '2>' and '1>'
+	matches := gRxUnixRedirect.FindAllStringSubmatch(cmd, -1)
+
+	for _, matcha := range matches {
+		if len(matcha) < 2 {
+			continue
+		}
+		redirect := matcha[0]
+		filepath := strings.TrimSpace(matcha[1])
+
+		cmd = strings.ReplaceAll(cmd, redirect, "")
+		paths = append(paths, filepath)
+	}
+
+	return cmd, paths
+}
+
+func GenerateCriteria(tid string) error {
+	var atomicTests = map[string][]*types.TestSpec{} // tid -> tests
 
 	var unsafeRegex = regexp.MustCompile(`(\s|^)(rm|del|remove|Remove-Item|rmdir)(\s|$)`)
 
-	/*
-		err := utils.LoadAtomicsIndexCsvPlatform(filepath.FromSlash(flagAtomicsPath), &atomicTests, flagPlatform)
-		if err != nil {
-			fmt.Println("Unable to load Indexes-CSV file for Atomics", err)
-			os.Exit(1)
-		}
+	err := utils.LoadAtomicsIndexCsvPlatform(filepath.FromSlash(flagAtomicsPath), &atomicTests, flagPlatform)
+	if err != nil {
+		fmt.Println("Unable to load Indexes-CSV file for Atomics", err)
+		return errors.New("EOF")
+	}
 
-	*/
+	if gVerbose {
+		fmt.Println("Searching for test", tid)
+	}
+
+	tests, ok := atomicTests[tid]
+
+	if !ok {
+		if gVerbose {
+			fmt.Println("An atomic test does not exist for this technique:", tid, "It could be an old copy of atomic-red-team repo or a fork or the criteria specifies an invalid technique")
+		}
+		// what error code should this return? for 'not found'?
+		return errors.New("EOF")
+	}
 
 	// if no tests are present, return error code 422 (standard for 'Unprocessable Entity')
+	if len(tests) == 0 {
+		return errors.New("EOF")
+	}
 
 	yaml, err := utils.LoadAtomicsTechniqueYaml(tid, flagAtomicsPath)
 
 	if err != nil {
-		fmt.Println("Could not load Yaml for ", tid)
-		return &GenCriteriaError{
-			StatusCode: 503,
-			Err:        errors.New("Unable to load Yaml for " + tid),
-		}
+		fmt.Println("Could not load Yaml for ", tid, err)
+		return errors.New("Failed to Load")
 	}
 	var outfile *os.File
 
@@ -416,10 +487,7 @@ func GenerateCriteria(tid string) *GenCriteriaError {
 
 		if writeErr != nil {
 			fmt.Println("ERROR: unable to create outfile", flagGenCriteriaOutPath+tid+".generated.csv", writeErr)
-			return &GenCriteriaError{
-				StatusCode: 100,
-				Err:        errors.New("Unable to load Yaml for " + tid),
-			}
+			return errors.New("io: read/write on closed pipe")
 		}
 		defer outfile.Close()
 	} else {
@@ -462,23 +530,45 @@ func GenerateCriteria(tid string) *GenCriteriaError {
 		}
 
 		//DEFAULT: Treat each command as a process event and use cmdline contains (~=) to show which command is run
-		for _, com := range strings.Split(cur.Executor.Command, "\n") {
-			if len(com) == 0 {
+		for _, rawcom := range strings.Split(cur.Executor.Command, "\n") {
+			if len(rawcom) == 0 {
 				continue
 			}
 
-			if !gUnsafe {
-				match := unsafeRegex.FindString(com)
-				if len(match) > 0 {
-					s += "!!!\n"
-					s += "FYI,Potentially destructive command found. Keyword: " + match + "\n"
-				}
+			pipedCommands := SplitPipedCommands(rawcom, cur.Executor.Name)
+			if len(pipedCommands) > 1 {
+				s += fmt.Sprintln("# " + rawcom)
+
 			}
 
-			out := []string{"_E_", "Process", "cmdline~=" + com}
-			s += strings.Join(out, ",")
-			s += fmt.Sprintln()
+			for _, com := range pipedCommands {
+				com, comment := stripCommandComment(com, cur.Executor.Name)
+				if len(com) == 0 {
+					continue
+				}
 
+				if !gUnsafe {
+					if unsafeRegex.MatchString(com) {
+						s += "!!!\n"
+						s += "FYI,Potentially destructive command found: " + com
+					}
+				}
+
+				com, redirectTargets := extractFileRedirects(com, cur.Executor.Name)
+
+				out := []string{"_E_", "Process", "cmdline~=" + com}
+				s += strings.Join(out, ",") // TODO: CSV comma quoting
+				s += fmt.Sprintln()
+				if len(comment) > 0 {
+					s += fmt.Sprintln("# " + comment)
+				}
+
+				for _, targetFile := range redirectTargets {
+					out := []string{"_E_", "File", "WRITE", "path~=" + targetFile}
+					s += strings.Join(out, ",") // TODO: CSV comma quoting
+					s += fmt.Sprintln()
+				}
+			}
 		}
 
 		outfile.WriteString(s)
@@ -488,16 +578,13 @@ func GenerateCriteria(tid string) *GenCriteriaError {
 	}
 
 	if len(flagGenCriteriaOutPath) > 0 {
-		fmt.Println("Generated Criteria for", tid, flagGenCriteriaOutPath+tid+".generated.csv")
+		fmt.Println("Generated Criteria for", tid, "available at ./data/generated/"+tid+".generated.csv")
 	}
 
-	return &GenCriteriaError{
-		StatusCode: 200,
-		Err:        errors.New("Criteria Generated for " + tid + " Successfully"),
-	}
+	//successful
+
+	return nil
 }
-
-//
 func GenerateAllCriteria() error {
 	var atomicTests = map[string][]*types.TestSpec{} // tid -> tests
 
@@ -515,15 +602,17 @@ func GenerateAllCriteria() error {
 				fmt.Println("Searching for test", test.Technique)
 			}
 
-			GenerateCriteria(test.Technique)
+			err := GenerateCriteria(test.Technique)
+
+			if err != nil {
+				fmt.Println(err)
+			}
 
 		}
 	}
 
-	return &GenCriteriaError{
-		StatusCode: 200,
-		Err:        errors.New("All Criteria Generated Successfully"),
-	}
+	//successful
+	return nil
 
 }
 
@@ -531,15 +620,12 @@ func GenerateAllCriteria() error {
 
 func main() {
 	flag.Parse()
+
 	if len(flagPlatform) == 0 {
 		flagPlatform = utils.GetPlatformName()
 	}
 
 	FillInToolPathDefaults()
-
-	if gGenCriteriaAll {
-		GenerateAllCriteria()
-	}
 
 	if gPatchCriteriaRefsMode {
 		PatchCriteriaGuids()
@@ -555,8 +641,14 @@ func main() {
 		FindTestCoverage()
 		return
 	}
-	if len(flagCriteriaPath) > 0 {
+
+	if len(flagGenCriteria) > 0 {
+		if flagGenCriteria == "all" {
+			GenerateAllCriteria()
+			return
+		}
 		GenerateCriteria(strings.ToUpper(flagGenCriteria))
 		return
 	}
+
 }
